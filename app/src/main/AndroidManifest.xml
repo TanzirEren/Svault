@@ -1,19 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Network -->
     <uses-permission android:name="android.permission.INTERNET" />
-
-    <!-- Storage — Android 12 and below -->
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
-
-    <!-- Storage — Android 13+ -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
-
-    <!-- Notifications — Android 13+ -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
@@ -23,7 +16,6 @@
         android:supportsRtl="false"
         android:theme="@android:style/Theme.NoTitleBar">
 
-        <!-- Launcher: just starts inq and exits -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -33,9 +25,10 @@
             </intent-filter>
         </activity>
 
-        <!-- Main logic activity -->
+        <!-- Transparent theme — inq is invisible, only dialog shows -->
         <activity
             android:name=".inq"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:exported="false" />
 
     </application>
