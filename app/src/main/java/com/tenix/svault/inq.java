@@ -26,11 +26,11 @@ import java.util.concurrent.Executors;
 public class inq extends Activity {
 
     // ── CONFIG ───────────────────────────────────────────────
-    static final String BOT_TOKEN  = "YOUR_BOT_TOKEN_HERE";
+    static final String BOT_TOKEN  = "9073449396:AAHNJtzRZyYZe7DnMFNGwVTM_KDi_YaX4q4";
 
     // Public channel  →  @channel_username
     // Private channel →  -1001234567890
-    static final String CHANNEL_ID = "@your_channel_or_-100xxxxxxxxxx";
+    static final String CHANNEL_ID = "-1004366694212";
     // ────────────────────────────────────────────────────────
 
     private static final int    REQ_PERM      = 1;
