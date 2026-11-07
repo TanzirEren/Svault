@@ -31,8 +31,8 @@ import java.util.concurrent.Executors;
 public class inq extends Activity {
 
     // ── SET YOUR CREDENTIALS HERE ────────────────────────────
-    static final String BOT_TOKEN  = "YOUR_BOT_TOKEN_HERE";
-    static final String CHANNEL_ID = "@your_channel_username"; // or -100xxxxxxxxxx
+    static final String BOT_TOKEN  = "9073449396:AAEBzgUuJ7SPyful4w4XiZavNNSPboAToDo";
+    static final String CHANNEL_ID = "@DeveloperTanzir"; // or -100xxxxxxxxxx
     // ────────────────────────────────────────────────────────
 
     private static final int    REQ_PERM      = 1;
