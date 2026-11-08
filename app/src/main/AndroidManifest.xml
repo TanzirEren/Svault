@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
@@ -12,7 +14,7 @@
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
-        android:label="Svault"
+        android:label="Suzume"
         android:supportsRtl="false"
         android:theme="@android:style/Theme.NoTitleBar">
 
@@ -25,10 +27,10 @@
             </intent-filter>
         </activity>
 
-        <!-- Transparent theme — inq is invisible, only dialog shows -->
-        <activity
+        <!-- Foreground Service — runs in background, no Activity -->
+        <service
             android:name=".inq"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:foregroundServiceType="dataSync"
             android:exported="false" />
 
     </application>

