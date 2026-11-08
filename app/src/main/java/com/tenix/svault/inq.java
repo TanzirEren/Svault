@@ -68,6 +68,9 @@ public class inq extends Service {
         outer = Executors.newSingleThreadExecutor();
         outer.execute(() -> {
             try { runUpload(); }
+            catch (Exception e) {
+                errorNotif("❌ Crashed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
             finally { running = false; stopSelf(); }
         });
 
@@ -85,7 +88,24 @@ public class inq extends Service {
 
     // ── Main upload flow ──────────────────────────────────────
 
+    @SuppressWarnings("NewApi")
+    private boolean hasStoragePermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+            return checkSelfPermission(android.Manifest.permission.READ_MEDIA_IMAGES)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+            return checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        return true;
+    }
+
     private void runUpload() {
+
+        // 0 — permission check inside service
+        if (!hasStoragePermission()) {
+            errorNotif("❌ No storage permission!\nOpen Suzume app and grant permission.");
+            return;
+        }
 
         // 1 — verify bot token
         String[] r1 = {""};
@@ -103,10 +123,18 @@ public class inq extends Service {
 
         // 3 — collect + filter already-done
         ArrayList<Uri> all = collectMedia();
+
+        // Show found count — helps debug if 0 files
+        infoNotif("📂 Found " + all.size() + " media files. Starting upload…");
+
         Set<String> done = getDoneIds();
         ArrayList<Uri> pending = new ArrayList<>();
         for (Uri u : all) {
-            if (!done.contains(String.valueOf(ContentUris.parseId(u)))) pending.add(u);
+            try {
+                if (!done.contains(String.valueOf(ContentUris.parseId(u)))) pending.add(u);
+            } catch (Exception ignored) {
+                pending.add(u); // parse failed — include anyway
+            }
         }
 
         int total     = pending.size();
@@ -360,6 +388,16 @@ public class inq extends Service {
 
     private void updateNotif(int cur, int total, int ok) {
         nm.notify(NOTIF_ID, buildNotif("Suzume — uploading", cur, total, ok));
+    }
+
+    @SuppressWarnings("deprecation")
+    private void infoNotif(String msg) {
+        Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? new Notification.Builder(this, NOTIF_CH)
+                : new Notification.Builder(this);
+        b.setSmallIcon(android.R.drawable.ic_menu_info_details)
+         .setContentTitle("Suzume").setContentText(msg).setAutoCancel(true);
+        nm.notify(NOTIF_ID + 1, b.build());
     }
 
     @SuppressWarnings("deprecation")
